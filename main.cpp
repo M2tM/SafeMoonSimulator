@@ -26,31 +26,47 @@
 #include <fstream>
 
 //Config Values:
-const double MaxSafeMoon = 1'000'000'000'000'000;
-const int InitialWalletsPerDay = 7500;
-const int TicksPerDay = 24;
-const double WalletsGrowthPerDay = 0.027;
-const double WalletGrowthRandomness = 0.5;
-const size_t HolderSummaryCount = 0;
+struct Config {
+	double MaxSafeMoon = 1'000'000'000'000'000;
 
-const double HypeMax = 6.0;
-const double HypeDurationMultiple = 1.75;
-const size_t HypeCycleDistance = TicksPerDay * 8;
-const double HypeCycleDuration = 0.25;
-const double HypeMin = .5;
+	double StartingLiquidityUsd = 22390605.0;
+	double CurrentSafeMoonPrice = 0.00000064;
+	double MinSafeMoonPrice = 0.00000005;
 
-const double HypePriceBonusMax = 4.0;
+	int InitialWalletsPerDay = 7500;
+	int TicksPerDay = 24;
+	int CandlesPerDay = 6;
+	double WalletsGrowthPerDay = 0.027;
+	double WalletGrowthRandomness = 0.5;
+	size_t HolderSummaryCount = 10;
 
-const double MaxToBuyAtOnce = 250'000;
+	double HypeMax = 6.0;
+	double HypeDurationMultiple = 1.5;
+	size_t HypeCycleDistance = TicksPerDay * 8;
+	double HypeCycleDuration = 0.25;
+	double HypeMin = .5;
 
-const double MaxToSellAtOnce = 250'000'000'000;
+	double HypePriceBonusMax = 4.0;
 
-const size_t TotalDays = 365;
+	double MaxToBuyAtOnce = 250'000;
 
-const double PersistentHypeVolumeBonus = 1.1;
+	double MaxToSellAtOnce = 250'000'000'000;
 
-const double InitialPersonalHoldings = 66'062'716'446;
-const double InitialPersonalBuyIn = 0.00000036;
+	size_t TotalDays = 365;
+
+	double PersistentHypeVolumeBonus = 1.1;
+
+	double InitialPersonalHoldings = 66'062'716'446;
+	double InitialPersonalBuyIn = 0.00000036;
+
+	int ChartDay = 14;
+	int ChartMonth = 4;
+	int ChartYear = 2021;
+
+	bool ReflectToLP = true;
+};
+
+Config config;
 
 std::string to_string_custom(double a_num) {
 	std::ostringstream streamObj;
@@ -168,7 +184,9 @@ public:
 	//simulation to query/clear it with this method and apply it to the wallets.
 	double getAndClearReflection() {
 		auto result = cachedReflection;
-		sfm += result * (sfm / MaxSafeMoon); //reflection currently adds to SFM liquidity.
+		if (config.ReflectToLP) {
+			sfm += result * (sfm / config.MaxSafeMoon); //reflection currently adds to SFM liquidity.
+		}
 		cachedReflection = 0.0;
 		return result;
 	}
@@ -221,7 +239,7 @@ public:
 			auto firstSfm = sfm;
 			for (auto&& strategy : strategies) {
 				if (!strategy->apply(sfm, amm)) {
-					cooldown = randomNumber(1, TicksPerDay);
+					cooldown = randomNumber(1, config.TicksPerDay);
 					return;
 				}
 			}
@@ -232,7 +250,13 @@ public:
 
 	void addBalance(double a_amount) { sfm += a_amount; }
 
-	void addReflection(double a_amount) { sfm += a_amount * (sfm / MaxSafeMoon); }
+	void addReflection(double a_amount, AutomaticMarketMaker& amm) { 
+		if (config.ReflectToLP) {
+			sfm += a_amount * (sfm / config.MaxSafeMoon);
+		} else {
+			sfm += a_amount * (sfm / (config.MaxSafeMoon - amm.safeMoonTotal()));
+		}
+	}
 protected:
 	bool cooldownCheck() {
 		cooldown = std::max(0, cooldown - 1);
@@ -254,10 +278,10 @@ public:
 
 	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
 		if (sfm > 0.0 && amm.sfmPrice() <= (entryPrice * percentLoss)) {
-			auto amountToSell = std::min(MaxToSellAtOnce, sfm * percentToSell);
+			auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
 			amm.sellSFM(amountToSell);
 			sfm -= amountToSell;
-			if (amountToSell != MaxToSellAtOnce) {
+			if (amountToSell != config.MaxToSellAtOnce) {
 				entryPrice = amm.sfmPrice(); //reset entry so if we fall percentLoss from here we trigger another sell.
 			}
 			return false;
@@ -282,10 +306,10 @@ public:
 		if (engaged) {
 			entryPrice = std::max(amm.sfmPrice(), entryPrice);
 			if (sfm > 0.0 && amm.sfmPrice() <= (entryPrice * percentLoss)) {
-				auto amountToSell = std::min(MaxToSellAtOnce, sfm * percentToSell);
+				auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
 				amm.sellSFM(amountToSell);
 				sfm -= amountToSell;
-				if (amountToSell != MaxToSellAtOnce) {
+				if (amountToSell != config.MaxToSellAtOnce) {
 					entryPrice = amm.sfmPrice(); //reset entry so if we fall percentLoss from here we trigger another sell.
 				}
 				return false;
@@ -312,10 +336,10 @@ public:
 
 	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
 		if (sfm > 0.0 && amm.sfmPrice() >= (entryPrice * percentGain)) {
-			auto amountToSell = std::min(MaxToSellAtOnce, sfm * percentToSell);
+			auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
 			amm.sellSFM(amountToSell);
 			sfm -= amountToSell;
-			if (amountToSell != MaxToSellAtOnce) {
+			if (amountToSell != config.MaxToSellAtOnce) {
 				entryPrice = amm.sfmPrice(); //reset entry so if we fall percentLoss from here we trigger another sell.
 			}
 			return false;
@@ -338,7 +362,7 @@ public:
 
 	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
 		if (sfm > 0.0 && countDown()) {
-			auto amountToSell = std::min(MaxToSellAtOnce, sfm * percentToSell);
+			auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
 			amm.sellSFM(amountToSell);
 			sfm -= amountToSell;
 			return false;
@@ -532,7 +556,7 @@ public:
 		wallets(a_initialWallets),
 		personalWallet(a_personalWallet){
 
-		double amountLeft = MaxSafeMoon - a_amm.safeMoonTotal() - totalWalletAmounts();
+		double amountLeft = config.MaxSafeMoon - a_amm.safeMoonTotal() - totalWalletAmounts();
 		size_t totalHodlers = 350'000 - wallets.size();
 
 		auto firstGeneratedWalletIndex = wallets.size();
@@ -545,22 +569,23 @@ public:
 		}
 
 		//top us off with whatever rounding error we have left
-		wallets[firstGeneratedWalletIndex]->addBalance(MaxSafeMoon - a_amm.safeMoonTotal() - totalWalletAmounts());
+		wallets[firstGeneratedWalletIndex]->addBalance(config.MaxSafeMoon - a_amm.safeMoonTotal() - totalWalletAmounts());
 	}
 
 	void tick() {
-		auto walletsToAddThisTick = randomNumber(static_cast<int>(walletsToAdd * WalletGrowthRandomness), walletsToAdd) * getHype();
+		needsSorting = true;
+		auto walletsToAddThisTick = randomNumber(static_cast<int>(walletsToAdd * config.WalletGrowthRandomness), walletsToAdd) * getHype();
 		for (int i = 0; i < walletsToAddThisTick; ++i) {
 			auto bucket = randomNumber(0, 4);
 			auto usdToBuySafeMoonWith = randomNumber(0.0, 1.0) > .995 
 				? mix(20'000.00, 100'000.00, randomNumber(0.0, 1.0), 1.0) //.5% chance for a "whale" purchase
 				: mix(5.0, 5'000.00, randomNumber(0.0, 1.0), 6.0); //Most buys are between 5 and 5,000, weighted on the low end.
-			usdToBuySafeMoonWith = std::min(MaxToBuyAtOnce, usdToBuySafeMoonWith * getHypePriceBonus());
+			usdToBuySafeMoonWith = std::min(config.MaxToBuyAtOnce, usdToBuySafeMoonWith * getHypePriceBonus());
 			auto sfmToInitializeWith = amm.buySFM(usdToBuySafeMoonWith);
 			wallets.push_back(randomHolderFactory(sfmToInitializeWith, amm.sfmPrice()));
 		}
 		std::cout << "SFM Price: " << amm.sfmPrice() << " SFM LP: " << amm.safeMoonTotal() << " USD LP: " << amm.usdTotal() << "\n";
-		walletsToAdd = walletsToAdd + walletsToAdd * (WalletsGrowthPerDay / TicksPerDay);
+		walletsToAdd = walletsToAdd + walletsToAdd * (config.WalletsGrowthPerDay / config.TicksPerDay);
 		for (auto&& wallet : wallets) {
 			wallet->update(amm);
 		}
@@ -572,23 +597,23 @@ public:
 	double getHype() {
 		if (currentTick >= currentHypeCycleDistance) {
 			auto hypeTick = currentTick - currentHypeCycleDistance;
-			auto maxHypeTick = HypeCycleDuration * currentHypeCycleDistance;
+			auto maxHypeTick = config.HypeCycleDuration * currentHypeCycleDistance;
 			if (hypeTick < maxHypeTick) {
-				return mixBackAndForth(1.0, HypeMax, static_cast<double>(hypeTick) / maxHypeTick, 3.0);
+				return mixBackAndForth(1.0, config.HypeMax, static_cast<double>(hypeTick) / maxHypeTick, 3.0);
 			} else {
 				currentTick = 0;
-				currentHypeCycleDistance *= HypeDurationMultiple;
-				walletsToAdd *= PersistentHypeVolumeBonus;
+				currentHypeCycleDistance *= config.HypeDurationMultiple;
+				walletsToAdd *= config.PersistentHypeVolumeBonus;
 			}
 		}
-		return mixBackAndForth(1.0, HypeMin, static_cast<double>(currentTick) / static_cast<double>(currentHypeCycleDistance), 1.0);
+		return mixBackAndForth(1.0, config.HypeMin, static_cast<double>(currentTick) / static_cast<double>(currentHypeCycleDistance), 1.0);
 	}
 
 	double getHypePriceBonus() {
 		if (currentTick >= currentHypeCycleDistance) {
 			auto hypeTick = currentTick - currentHypeCycleDistance;
-			auto maxHypeTick = HypeCycleDuration * currentHypeCycleDistance;
-			return mixBackAndForth(1.0, HypePriceBonusMax, static_cast<double>(hypeTick) / maxHypeTick, 3.0);
+			auto maxHypeTick = config.HypeCycleDuration * currentHypeCycleDistance;
+			return mixBackAndForth(1.0, config.HypePriceBonusMax, static_cast<double>(hypeTick) / maxHypeTick, 3.0);
 		}
 		return 1.0;
 	}
@@ -597,25 +622,50 @@ public:
 		return amm.sfmPrice();
 	}
 
-	void summary(int day) {
-		std::cout << "____________DAY["<<day<<"]____________\nPrice: " << amm.sfmPrice() << " | Volume: " << inMillions(amm.getAndClearVolume()) << "M | USD Market Cap: " << inBillions(amm.sfmPrice() * (MaxSafeMoon - wallets[0]->balance() - amm.safeMoonTotal())) << "B | Burn: " << inTrillions(burnToday) << "T | Hodlers: " << wallets.size() << "\n";
-		burnToday = 0.0;
-		if (HolderSummaryCount > 0) {
+	double getCandleVolume() {
+		auto volume = amm.getAndClearVolume();
+		if (volume != 0) {
+			candleVolume = volume;
+			dailyVolume += candleVolume;
+		}
+		return candleVolume;
+	}
+
+	//returns the accumulated "getCandleVolume" results.
+	double getDailyVolume() {
+		auto volume = amm.getAndClearVolume();
+		if (volume != 0) {
+			dailyVolume = volume;
+		}
+		return dailyVolume;
+	}
+
+	void summary(int day, std::ostream& streamOutput, int holdersToDisplay = -1) {
+		if (holdersToDisplay < 0) { holdersToDisplay = config.HolderSummaryCount; }
+		streamOutput << "____________DAY["<<day<<"]____________\n<br/>Price: " << amm.sfmPrice() << " | Volume: " << inMillions(getDailyVolume()) << "M | USD Market Cap: " << inBillions(amm.sfmPrice() * (config.MaxSafeMoon - wallets[0]->balance())) << "B | Burn: " << inTrillions(burnToday) << "T | Hodlers: " << wallets.size() << "\n<br/>";
+		streamOutput << "AMM LP) SFM: " << inTrillions(amm.safeMoonTotal()) << "T | USD: $" << inMillions(amm.usdTotal()) << "M<br/>\n";
+		if (holdersToDisplay > 0 && needsSorting) {
+			needsSorting = false;
 			std::sort(wallets.begin(), wallets.end(), [](const std::shared_ptr<WalletHolder>& a_lhs, const std::shared_ptr<WalletHolder>& a_rhs) {
 				return a_lhs->balance() > a_rhs->balance();
-				});
+			});
 		}
 
-		std::cout << "Top " << HolderSummaryCount << " Holders:\n";
-		for (int i = 0; i < std::max(static_cast<size_t>(1), HolderSummaryCount); ++i) {
-			std::cout << "(" << i << ") SFM: " << wallets[i]->balance() << "\t|USD: " << (wallets[i]->balance() * amm.sfmPrice()) << "\t|" << wallets[i]->tag() << "\n";
+		streamOutput << "Top " << holdersToDisplay << " Holders:\n<br/>";
+		for (int i = 0; i < std::max(static_cast<int>(1), holdersToDisplay); ++i) {
+			streamOutput << "(" << i << ") SFM: " << wallets[i]->balance() << "\t|USD: " << (wallets[i]->balance() * amm.sfmPrice()) << "\t|" << wallets[i]->tag() << "\n<br/>";
 		}
 
 		if (personalWallet) {
-			std::cout << "\n...\n--->(Personal) SFM: " << personalWallet->balance() << "\t|USD: " << (personalWallet->balance() * amm.sfmPrice()) << "\n";
+			streamOutput << "\n<br/>...\n<br/>--->(Personal) SFM: " << personalWallet->balance() << "\t|USD: " << (personalWallet->balance() * amm.sfmPrice()) << "\n<br/>";
 		}
 
-		std::cout << "\n______________________________" << std::endl;
+		streamOutput << "\n<br/>______________________________" << std::endl;
+	}
+
+	void clearDay() {
+		dailyVolume = 0.0;
+		burnToday = 0.0;
 	}
 private:
 	double inTrillions(double input) const {
@@ -642,18 +692,22 @@ private:
 		double initialBurnBalance = wallets[0]->balance();
 		auto reflectedAmount = amm.getAndClearReflection();
 		for (auto&& wallet : wallets) {
-			wallet->addReflection(reflectedAmount);
+			wallet->addReflection(reflectedAmount, amm);
 		}
 		burnToday += wallets[0]->balance() - initialBurnBalance;
 	}
 
 	double burnToday = 0.0;
-	int walletsToAdd = InitialWalletsPerDay / TicksPerDay;
+	double candleVolume = 0.0;
+	double dailyVolume = 0.0;
+	int walletsToAdd = config.InitialWalletsPerDay / config.TicksPerDay;
 	std::vector<std::shared_ptr<WalletHolder>> wallets;
 	AutomaticMarketMaker amm;
 	std::shared_ptr<WalletHolder> personalWallet;
 	size_t currentTick = 0;
-	size_t currentHypeCycleDistance = HypeCycleDistance;
+	size_t currentHypeCycleDistance = config.HypeCycleDistance;
+
+	bool needsSorting = false;
 };
 
 
@@ -665,62 +719,96 @@ void renderHeader(std::ofstream &display) {
 	display << R"(
 <!DOCTYPE HTML>
 <html>
-<head>  
-<script>
-window.onload = function () {
+<head>
+<script type="text/javascript" src="https://canvasjs.com/assets/script/jquery-1.11.1.min.js"></script>
+<script type="text/javascript" src="https://canvasjs.com/assets/script/canvasjs.stock.min.js"></script>
+<script type="text/javascript">
+Date.prototype.addDays = function(days) {
+    var date = new Date(this.valueOf());
+    date.setDate(date.getDate() + days);
+    return date;
+}
 
-var chart = new CanvasJS.Chart("chartContainer", {
-	animationEnabled: true,
-	theme: "light2",
-	title:{
-		text: "Safe Moon For 365 Days"
-	},
-	data: [{        
-		type: "line",
-      	indexLabelFontSize: 16,
-		dataPoints: [
+Date.prototype.addHours = function(h) {
+  this.setTime(this.getTime() + (h*60*60*1000));
+  return this;
+}
+
+window.onload = function () {
+  var dataPoints1 = [], dataPoints2 = [];
 )";
 }
 
-void renderPricePoint(std::ofstream& display, double price) {
-	display << "{ y: " << price << " },\n";
+void renderPricePoint(std::ofstream& display, double day, double hour, double volume, double open, double close, double high, double low) {
+	display << "dataPoints1.push({x: new Date(" << config.ChartYear << ", " << config.ChartMonth << ", " << config.ChartDay << ").addDays("<<day<<").addHours("<<hour<<"), y: [Number("<<open<<"), Number("<<high<<"), Number("<<low<<"), Number("<<close<<")]});\n";
+	display << "dataPoints2.push({x: new Date(" << config.ChartYear << ", " << config.ChartMonth << ", " << config.ChartDay << ").addDays("<<day<<").addHours("<<hour<<"), y : Number("<<volume<<") });\n";
 }
 
-void renderFooter(std::ofstream& display, const std::shared_ptr<WalletHolder> &a_personalWallet, double a_finalPrice) {
+void renderFooter(std::ofstream& display, const std::shared_ptr<WalletHolder> &a_personalWallet, Simulation& a_simulation, const std::string& a_summaryText) {
 	display << R"(
-		]
-	}]
-});
-chart.render();
-
+  var stockChart = new CanvasJS.StockChart("chartContainer",{
+    exportEnabled: true,
+    title:{
+      text:"SafeMoon"
+    },
+    subtitles: [{
+      text: "SafeMoon Price Simulation"
+    }],
+    charts: [{
+      axisX: {
+        crosshair: {
+          enabled: true,
+          snapToDataPoint: true
+        }
+      },
+      axisY: {
+        prefix: "$",
+        lineThickness: 0
+      },
+      data: [{
+        name: "Price (in USD) ",
+        yValueFormatString: "$#.###,###,###",
+        type: "candlestick",
+        dataPoints : dataPoints1
+      }]
+    }],
+    navigator: {
+      data: [{
+        dataPoints: dataPoints2
+      }],
+      slider: {
+        minimum: new Date(2018, 10, 01),
+        maximum: new Date(2018, 11, 20)
+      }
+    }
+  });
+  
+  stockChart.render();
 }
 </script>
 </head>
 <body>
-<div id="chartContainer" style="height: 300px; width: 100%;"></div>
-<script src="https://canvasjs.com/assets/script/canvasjs.min.js"></script>
+<div id="chartContainer" style="height: 400px; width: 100%;"></div>
 <h2>Personal Gains</h2>)";
 	
-	auto initialHoldingsUSD = (InitialPersonalHoldings * InitialPersonalBuyIn);
-	auto finalHoldingsUSD = (a_personalWallet->balance() * a_finalPrice);
-	display << "Initial Holdings: " << InitialPersonalHoldings << " SFM : $" << initialHoldingsUSD << " USD<br/>\n";
-	display << "Final Holdings: " << a_personalWallet->balance() << " SFM : $" << finalHoldingsUSD << " USD<br/>\n";
-	display << "SFM Reflected: " << (a_personalWallet->balance() - InitialPersonalHoldings) << " | Total USD Gains: " << (finalHoldingsUSD - initialHoldingsUSD) << "<br/>\n";
-	display << "Value of Reflected SFM in USD: $" << ((a_personalWallet->balance() - InitialPersonalHoldings) * a_finalPrice) << " USD";
+	auto initialHoldingsUSD = (config.InitialPersonalHoldings * config.InitialPersonalBuyIn);
+	auto finalHoldingsUSD = (a_personalWallet->balance() * a_simulation.currentPrice());
+	display << "\n<b>Initial Holdings:</b> " << config.InitialPersonalHoldings << " <b>SFM</b> | $" << initialHoldingsUSD << " <b>USD</b><br/>\n";
+	display << "<b>Final Holdings:</b> " << a_personalWallet->balance() << " <b>SFM</b> | $" << finalHoldingsUSD << " <b>USD</b><br/>\n";
+	display << "<b>SFM Reflected:</b> " << (a_personalWallet->balance() - config.InitialPersonalHoldings) << " | <b>Total Gains</b>: $" << (finalHoldingsUSD - initialHoldingsUSD) << " <b>USD</b><br/>\n";
+	display << "<b>Value of Reflected SFM in USD:</b> $" << ((a_personalWallet->balance() - config.InitialPersonalHoldings) * a_simulation.currentPrice()) << " <b>USD</b><br/><br/>\n";
+
+	display << "<div style='width:100%;height:350px;overflow-y:auto;'>\n" << a_summaryText << "</div>\n";
 
 	display << "</body>\n</html>\n";
 }
 
 int main() {
-	const double startingLiquidityUsd = 22390605.0;
-	const double currentSafeMoonPrice = 0.00000064;
-	const double minSafeMoonPrice = 0.00000005;
-
 	auto makeInitialHolder = [=](double sfm) {
-		return randomHolderFactory(sfm, randomNumber(minSafeMoonPrice, currentSafeMoonPrice));
+		return randomHolderFactory(sfm, randomNumber(config.MinSafeMoonPrice, config.CurrentSafeMoonPrice));
 	};
 
-	auto personalWallet = std::make_shared<WalletHolder>(InitialPersonalHoldings, InitialPersonalBuyIn, "Personal");
+	auto personalWallet = std::make_shared<WalletHolder>(config.InitialPersonalHoldings, config.InitialPersonalBuyIn, "Personal");
 
 	std::vector<std::shared_ptr<WalletHolder>> initialHolders {
 		std::make_shared<WalletHolder>(401'252'856'803'308, 0.0), //Burn address
@@ -766,20 +854,32 @@ int main() {
 	std::cout << std::setprecision(9) << std::fixed;
 
 	Simulation simulation(
-		AutomaticMarketMaker{ sfmForPriceInUSD(startingLiquidityUsd, 0.00000064), startingLiquidityUsd },
+		AutomaticMarketMaker{ sfmForPriceInUSD(config.StartingLiquidityUsd, 0.00000064), config.StartingLiquidityUsd },
 		initialHolders,
 		personalWallet
 	);
 
+	std::stringstream summaryText;
+	summaryText << std::setprecision(9) << std::fixed;
 	std::ofstream display("render.html", std::ofstream::trunc);
 	display << std::setprecision(9) << std::fixed;
 	renderHeader(display);
-	for (int d = 0; d < TotalDays; ++d) {
-		for (int h = 0; h < TicksPerDay; ++h) {
-			simulation.tick();
-			renderPricePoint(display, simulation.currentPrice());
+	for (int d = 0; d < config.TotalDays; ++d) {
+		
+		for (int h = 0; h < config.TicksPerDay;) {
+			double open = simulation.currentPrice();
+			double high = open;
+			double low = open;
+			for (; ++h % (config.TicksPerDay / config.CandlesPerDay) != 0;) {
+				simulation.tick();
+				high = std::max(simulation.currentPrice(), high);
+				low = std::min(simulation.currentPrice(), low);
+			}
+			renderPricePoint(display, d, h, simulation.getCandleVolume(), open, simulation.currentPrice(), high, low);
 		}
-		simulation.summary(d);
+		simulation.summary(d, std::cout);
+		simulation.summary(d, summaryText);
+		simulation.clearDay();
 	}
-	renderFooter(display, personalWallet, simulation.currentPrice());
+	renderFooter(display, personalWallet, simulation, summaryText.str());
 }
