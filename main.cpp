@@ -24,6 +24,7 @@
 #include <chrono>
 #include <functional>
 #include <fstream>
+#include <map>
 
 //Config Values:
 struct Config {
@@ -36,15 +37,15 @@ struct Config {
 	int InitialWalletsPerDay = 7500;
 	int TicksPerDay = 24;
 	int CandlesPerDay = 6;
-	double WalletsGrowthPerDay = 0.027;
-	double WalletGrowthRandomness = 0.5;
+	double WalletsGrowthPerDay = 0.028;
+	double WalletGrowthRandomness = 0.4;
 	size_t HolderSummaryCount = 10;
 
 	double HypeMax = 6.0;
 	double HypeDurationMultiple = 1.5;
 	size_t HypeCycleDistance = TicksPerDay * 8;
 	double HypeCycleDuration = 0.25;
-	double HypeMin = .5;
+	double HypeMin = .25;
 
 	double HypePriceBonusMax = 4.0;
 
@@ -54,7 +55,7 @@ struct Config {
 
 	size_t TotalDays = 365;
 
-	double PersistentHypeVolumeBonus = 1.1;
+	double PersistentHypeVolumeBonus = 1.2;
 
 	double InitialPersonalHoldings = 66'062'716'446;
 	double InitialPersonalBuyIn = 0.00000036;
@@ -206,11 +207,13 @@ private:
 	double volume = 0.0;
 };
 
+class WalletHolder;
+
 class TradingStrategy {
 public:
 	std::string tag() const { return ""; }
 	//return false to stop applying further strategies this frame.
-	virtual bool apply(double& sfm, AutomaticMarketMaker& amm) { return true; }
+	virtual bool apply(WalletHolder& wallet, AutomaticMarketMaker& amm) { return true; }
 
 	void setEntry(double a_entryAmount, double a_entryPrice) {
 		entryAmount = a_entryAmount;
@@ -223,22 +226,25 @@ protected:
 
 class WalletHolder {
 public:
-	WalletHolder(double a_sfm, double a_entryPrice, std::string a_tag = "Burn Address", std::vector<std::shared_ptr<TradingStrategy>> a_strategies = {}) :
+	WalletHolder(double a_sfm, double a_entryPrice, std::shared_ptr<std::string> a_tag = nullptr, std::vector<std::shared_ptr<TradingStrategy>> a_strategies = {}) :
 		ourTag(a_tag),
 		sfm(a_sfm),
-		strategies(a_strategies) {
+		strategies(a_strategies),
+		totalUsd(a_sfm * -a_entryPrice){
 		for (auto&& strategy : strategies) {
 			strategy->setEntry(a_sfm, a_entryPrice);
 		}
 	}
 
-	virtual std::string tag() const { return ourTag; }
+	const std::string& tag() const { 
+		const static std::string burnAddress = "Burn Address";
+		return !ourTag ? burnAddress : *ourTag;
+	}
 
 	virtual void update(AutomaticMarketMaker& amm) {
 		if (cooldownCheck()) {
-			auto firstSfm = sfm;
 			for (auto&& strategy : strategies) {
-				if (!strategy->apply(sfm, amm)) {
+				if (!strategy->apply(*this, amm)) {
 					cooldown = randomNumber(1, config.TicksPerDay);
 					return;
 				}
@@ -257,15 +263,35 @@ public:
 			sfm += a_amount * (sfm / (config.MaxSafeMoon - amm.safeMoonTotal()));
 		}
 	}
+
+	//don't try and sell or buy more than you have, no built in checks
+	bool sellSfm(double a_amount, AutomaticMarketMaker& amm) {
+		auto amountToSell = std::min(config.MaxToSellAtOnce, a_amount);
+		totalUsd += amm.sellSFM(amountToSell);
+		sfm -= a_amount;
+		return amountToSell != config.MaxToSellAtOnce;
+	}
+
+	bool buySfm(double a_amount, AutomaticMarketMaker& amm) {
+		auto amountToBuyUSD = std::min(config.MaxToBuyAtOnce, a_amount);
+		sfm += amm.buySFM(amountToBuyUSD);
+		totalUsd -= amountToBuyUSD;
+		return amountToBuyUSD != config.MaxToBuyAtOnce;
+	}
+
+	double getSpentVsEarnedUSD() const {
+		return totalUsd;
+	}
 protected:
 	bool cooldownCheck() {
 		cooldown = std::max(0, cooldown - 1);
 		return cooldown == 0;
 	}
 
-	std::string ourTag;
+	std::shared_ptr<std::string> ourTag;
 	int cooldown = 0;
 	double sfm;
+	double totalUsd = 0.0;
 	std::vector<std::shared_ptr<TradingStrategy>> strategies;
 };
 
@@ -276,12 +302,9 @@ public:
 		percentToSell(a_percentToSell) {
 	}
 
-	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
-		if (sfm > 0.0 && amm.sfmPrice() <= (entryPrice * percentLoss)) {
-			auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
-			amm.sellSFM(amountToSell);
-			sfm -= amountToSell;
-			if (amountToSell != config.MaxToSellAtOnce) {
+	bool apply(WalletHolder& wallet, AutomaticMarketMaker& amm) override {
+		if (wallet.balance() > 0.0 && amm.sfmPrice() <= (entryPrice * percentLoss)) {
+			if (wallet.sellSfm(wallet.balance() * percentToSell, amm)) {
 				entryPrice = amm.sfmPrice(); //reset entry so if we fall percentLoss from here we trigger another sell.
 			}
 			return false;
@@ -302,14 +325,11 @@ public:
 		percentToSell(a_percentToSell) {
 	}
 
-	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
+	bool apply(WalletHolder& wallet, AutomaticMarketMaker& amm) override {
 		if (engaged) {
 			entryPrice = std::max(amm.sfmPrice(), entryPrice);
-			if (sfm > 0.0 && amm.sfmPrice() <= (entryPrice * percentLoss)) {
-				auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
-				amm.sellSFM(amountToSell);
-				sfm -= amountToSell;
-				if (amountToSell != config.MaxToSellAtOnce) {
+			if (wallet.balance() > 0.0 && amm.sfmPrice() <= (entryPrice * percentLoss)) {
+				if (wallet.sellSfm(wallet.balance() * percentToSell, amm)) {
 					entryPrice = amm.sfmPrice(); //reset entry so if we fall percentLoss from here we trigger another sell.
 				}
 				return false;
@@ -334,12 +354,9 @@ public:
 		percentToSell(a_percentToSell) {
 	}
 
-	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
-		if (sfm > 0.0 && amm.sfmPrice() >= (entryPrice * percentGain)) {
-			auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
-			amm.sellSFM(amountToSell);
-			sfm -= amountToSell;
-			if (amountToSell != config.MaxToSellAtOnce) {
+	bool apply(WalletHolder& wallet, AutomaticMarketMaker& amm) override {
+		if (wallet.balance() > 0.0 && amm.sfmPrice() >= (entryPrice * percentGain)) {
+			if (wallet.sellSfm(wallet.balance() * percentToSell, amm)) {
 				entryPrice = amm.sfmPrice(); //reset entry so if we fall percentLoss from here we trigger another sell.
 			}
 			return false;
@@ -360,11 +377,9 @@ public:
 		resetCountdown();
 	}
 
-	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
-		if (sfm > 0.0 && countDown()) {
-			auto amountToSell = std::min(config.MaxToSellAtOnce, sfm * percentToSell);
-			amm.sellSFM(amountToSell);
-			sfm -= amountToSell;
+	bool apply(WalletHolder& wallet, AutomaticMarketMaker& amm) override {
+		if (wallet.balance() > 0.0 && countDown()) {
+			wallet.sellSfm(wallet.balance() * percentToSell, amm);
 			return false;
 		}
 		return true;
@@ -395,10 +410,9 @@ public:
 		resetCountdown();
 	}
 
-	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
+	bool apply(WalletHolder& wallet, AutomaticMarketMaker& amm) override {
 		if (countDown()) {
-			auto amountToBuyUSD = (entryPrice * entryAmount) * percentOfOriginalHoldingsInUSDToBuy;
-			sfm += amm.buySFM(amountToBuyUSD);
+			wallet.buySfm((entryPrice * entryAmount) * percentOfOriginalHoldingsInUSDToBuy, amm);
 			return false;
 		}
 		return true;
@@ -428,11 +442,10 @@ public:
 		percentOfOriginalHoldingsInUSDToBuy(a_percentOfOriginalHoldingsInUSDToBuy) {
 	}
 
-	bool apply(double& sfm, AutomaticMarketMaker& amm) override {
+	bool apply(WalletHolder& wallet, AutomaticMarketMaker& amm) override {
 		currentTop = std::max(amm.sfmPrice(), currentTop);
 		if (cooldownCheck() && (amm.sfmPrice() <= (entryPrice * percentLoss))) {
-			auto amountToBuyUSD = (entryPrice * entryAmount) * percentOfOriginalHoldingsInUSDToBuy;
-			sfm += amm.buySFM(amountToBuyUSD);
+			wallet.buySfm((entryPrice * entryAmount) * percentOfOriginalHoldingsInUSDToBuy, amm);
 			cooldown = cooldownResetValue;
 			currentTop = amm.sfmPrice(); //let's reset the local top now that we've "bought the dip" in addition to the cooldown period of 7 days.
 			return false;
@@ -454,59 +467,70 @@ private:
 	double percentOfOriginalHoldingsInUSDToBuy;
 };
 
+std::shared_ptr<std::string> sharedString(const std::string& a_input) {
+	static std::map<std::string, std::shared_ptr<std::string>> strings;
+	auto found = strings.find(a_input);
+	if (found != strings.end()) {
+		return found->second;
+	}
+	auto toAdd = std::make_shared<std::string>(a_input);
+	strings[a_input] = toAdd;
+	return toAdd;
+}
+
 
 std::shared_ptr<WalletHolder> randomHolderFactory(double a_sfm, double a_entry) {
 	static std::vector<std::function<std::shared_ptr<WalletHolder> (double a_sfm, double a_entry)>> generators {
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Hold Until Exit + StopLoss", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Hold Until Exit + StopLoss"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TakeProfitOnGain>(randomNumber(1.25, 5.0)),
 				std::make_shared<StopLoss>(randomNumber(.15, .75))
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Skim Profits + StopLoss", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Skim Profits + StopLoss"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TakeProfitOnGain>(randomNumber(1.25, 5.0), .25),
 				std::make_shared<StopLoss>(randomNumber(.15, .75))
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "To The Moon Then Out", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("To The Moon Then Out"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TakeProfitOnGain>(randomNumber(5.00, 30.0))
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "To The Moon + Dip Buy", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("To The Moon + Dip Buy"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TakeProfitOnGain>(randomNumber(5.00, 30.0)),
 				std::make_shared<DipBuy>(randomNumber(.6, .95), randomNumber(.25, 2.0))
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Trailing Gains + StopLoss", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Trailing Gains + StopLoss"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TrailingStopLoss>(randomNumber(.8, .95), randomNumber(2.00, 5.00)),
 				std::make_shared<StopLoss>(randomNumber(.15, .75))
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Trailing Gains + StopLoss + DipBuy", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Trailing Gains + StopLoss + DipBuy"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TrailingStopLoss>(randomNumber(.8, .95), randomNumber(2.00, 5.00)),
 				std::make_shared<DipBuy>(randomNumber(.6, .95), randomNumber(.25, 2.0)),
 				std::make_shared<StopLoss>(randomNumber(.15, .55))
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Trailing Gains + Random Sell", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Trailing Gains + Random Sell"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TrailingStopLoss>(randomNumber(.8, .95), randomNumber(2.00, 5.00), .25),
 				std::make_shared<TimedSell>(std::make_pair(24 * 14, 24 * 30), .1)
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Trailing Gains + Random Sell", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Trailing Gains + Random Sell"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TimedBuy>(std::make_pair(24 * 3, 24 * 14), .25),
 				std::make_shared<TimedSell>(std::make_pair(24 * 3, 24 * 14), .25)
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Profit Exit + Buying/Selling", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Profit Exit + Buying/Selling"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TakeProfitOnGain>(randomNumber(1.25, 3.5)),
 				std::make_shared<StopLoss>(randomNumber(.25, .75)),
 				std::make_shared<TimedBuy>(std::make_pair(24 * 3, 24 * 14), .25),
@@ -514,7 +538,7 @@ std::shared_ptr<WalletHolder> randomHolderFactory(double a_sfm, double a_entry) 
 			});
 		}},
 		{[](double a_sfm, double a_entry) { 
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Profit Taking + Buying/Selling", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Profit Taking + Buying/Selling"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TakeProfitOnGain>(randomNumber(1.25, 3.5), .25),
 				std::make_shared<StopLoss>(randomNumber(.25, .75)),
 				std::make_shared<TimedBuy>(std::make_pair(24 * 3, 24 * 14), .25),
@@ -522,24 +546,24 @@ std::shared_ptr<WalletHolder> randomHolderFactory(double a_sfm, double a_entry) 
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Profit Taking + Selling", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Profit Taking + Selling"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TakeProfitOnGain>(randomNumber(1.25, 3.5), .25),
 				std::make_shared<TimedSell>(std::make_pair(24 * 3, 24 * 14), .25)
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Trailing Profit + Dip Buy", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Trailing Profit + Dip Buy"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<DipBuy>(randomNumber(.8, .95), randomNumber(.25, 2.0)),
 				std::make_shared<TrailingStopLoss>(randomNumber(.8, .95), randomNumber(2.00, 3.00), .5)
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Scale Out", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Scale Out"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TimedSell>(std::make_pair(24 * 3, 24 * 14), .25)
 			});
 		}},
 		{[](double a_sfm, double a_entry) {
-			return std::make_shared<WalletHolder>(a_sfm, a_entry, "Scale Out + Buy Dip", std::vector<std::shared_ptr<TradingStrategy>>{
+			return std::make_shared<WalletHolder>(a_sfm, a_entry, sharedString("Scale Out + Buy Dip"), std::vector<std::shared_ptr<TradingStrategy>>{
 				std::make_shared<TimedSell>(std::make_pair(24 * 3, 24 * 14), .25),
 				std::make_shared<DipBuy>(randomNumber(.8, .95), randomNumber(.25, 2.0))
 			});
@@ -653,7 +677,7 @@ public:
 
 		streamOutput << "Top " << holdersToDisplay << " Holders:\n<br/>";
 		for (int i = 0; i < std::max(static_cast<int>(1), holdersToDisplay); ++i) {
-			streamOutput << "(" << i << ") SFM: " << wallets[i]->balance() << "\t|USD: " << (wallets[i]->balance() * amm.sfmPrice()) << "\t|" << wallets[i]->tag() << "\n<br/>";
+			streamOutput << "(" << i << ") SFM: " << inTrillions(wallets[i]->balance()) << "T  |USD: $" << inMillions(wallets[i]->balance() * amm.sfmPrice()) << "M | Earned/Spent: $" << wallets[i]->getSpentVsEarnedUSD() << " |: " << wallets[i]->tag() << "\n<br/>";
 		}
 
 		if (personalWallet) {
@@ -808,7 +832,7 @@ int main() {
 		return randomHolderFactory(sfm, randomNumber(config.MinSafeMoonPrice, config.CurrentSafeMoonPrice));
 	};
 
-	auto personalWallet = std::make_shared<WalletHolder>(config.InitialPersonalHoldings, config.InitialPersonalBuyIn, "Personal");
+	auto personalWallet = std::make_shared<WalletHolder>(config.InitialPersonalHoldings, config.InitialPersonalBuyIn, sharedString("Personal"));
 
 	std::vector<std::shared_ptr<WalletHolder>> initialHolders {
 		std::make_shared<WalletHolder>(401'252'856'803'308, 0.0), //Burn address
