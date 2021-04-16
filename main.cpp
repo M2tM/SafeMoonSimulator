@@ -64,7 +64,11 @@ struct Config {
 	int ChartMonth = 4;
 	int ChartYear = 2021;
 
-	bool ReflectToLP = true;
+	double TaxAmount = .1;
+	double ReflectionAmountFromTax = .5; //Reflections also go to the burn wallet
+	double BurnAmountFromLiquidity = 0.0; //If we wanted to have LP of 3% and burn of 2% for example, we would set this to .4
+
+	bool ReflectToLP = true; //Turn to fals to exclude the LP from SFM reflection rewards.
 };
 
 Config config;
@@ -106,6 +110,8 @@ int randomNumber(int a_min, int a_max) {
 	return std::uniform_int_distribution<int>(a_min, a_max)(gen);
 }
 
+class WalletHolder;
+
 class AutomaticMarketMaker {
 public:
 	AutomaticMarketMaker(double a_sfm, double a_usd) :
@@ -120,54 +126,15 @@ public:
 	double usdPrice() const {
 		return sfm / usd;
 	}
+
+	//Only used if we want to simulate the burn address taking half of the LP.
+	void setBurnWallet(const std::shared_ptr<WalletHolder>& a_burnAddress) {
+		burnAddress = a_burnAddress;
+	}
 	
-	double sellSFM(double a_sfm) {
-		auto fee = a_sfm * .1;
-		auto reflectAmount = fee / 2.0;
-		auto liquidityPairAmount = reflectAmount / 2.0;
+	double sellSFM(double a_sfm);
 
-		auto sfmMinusFee = a_sfm - fee;
-
-		sfm += liquidityPairAmount;
-
-		volume += a_sfm / usdPrice();
-
-		auto usdToTransact = sfmMinusFee / usdPrice();
-
-		usd -= usdToTransact;
-		sfm += sfmMinusFee;
-
-		cachedReflection += reflectAmount;
-
-		if (usd < 0) {
-			throw std::runtime_error("Failed To Sell SFM! Not enough liquidity!");
-		}
-
-		return usdToTransact;
-	}
-
-	double buySFM(double a_usd) {
-		auto fee = a_usd * .1;
-		auto reflectAmount = fee / 2.0;
-		auto liquidityPairAmount = reflectAmount / 2.0;
-
-		auto usdMinusFee = a_usd - fee;
-		usd += liquidityPairAmount;
-
-		cachedReflection += reflectAmount / sfmPrice();
-
-		auto totalSfmToBuy = usdMinusFee / sfmPrice();
-		sfm -= totalSfmToBuy;
-		usd += usdMinusFee;
-
-		if (sfm < 0) {
-			throw std::runtime_error("Failed To Buy SFM! Not enough liquidity!");
-		}
-
-		volume += a_usd;
-
-		return totalSfmToBuy;
-	}
+	double buySFM(double a_usd);
 
 	double safeMoonTotal() const {
 		return sfm;
@@ -199,6 +166,7 @@ public:
 	}
 
 private:
+	std::shared_ptr<WalletHolder> burnAddress;
 	double cachedReflection = 0.0;
 
 	double sfm;
@@ -294,6 +262,68 @@ protected:
 	double totalUsd = 0.0;
 	std::vector<std::shared_ptr<TradingStrategy>> strategies;
 };
+
+
+double taxAmount = .1;
+double reflectionAmountFromTax = .5;
+double liquidityAmountFromRemainder = 1.0; // whatever is left over would be the burn amount.
+
+double AutomaticMarketMaker::sellSFM(double a_sfm) {
+	auto fee = a_sfm * config.TaxAmount;
+	auto reflectAmount = fee * config.ReflectionAmountFromTax;
+	auto burnAmount = reflectAmount * config.BurnAmountFromLiquidity;
+	auto liquidityPairAmount = (reflectAmount - burnAmount) * .5;
+	if (burnAmount > 0 && burnAddress) {
+		burnAddress->addBalance(burnAmount);
+	}
+
+	auto sfmMinusFee = a_sfm - fee;
+
+	sfm += liquidityPairAmount;
+
+	volume += a_sfm / usdPrice();
+
+	auto usdToTransact = sfmMinusFee / usdPrice();
+
+	usd -= usdToTransact;
+	sfm += sfmMinusFee;
+
+	cachedReflection += reflectAmount;
+
+	if (usd < 0) {
+		throw std::runtime_error("Failed To Sell SFM! Not enough liquidity!");
+	}
+
+	return usdToTransact;
+}
+
+double AutomaticMarketMaker::buySFM(double a_usd) {
+	auto fee = a_usd * config.TaxAmount;
+	auto reflectAmount = fee * config.ReflectionAmountFromTax;
+	auto burnAmount = reflectAmount * config.BurnAmountFromLiquidity;
+	auto liquidityPairAmount = (reflectAmount - burnAmount) * .5;
+
+	auto usdMinusFee = a_usd - fee;
+	usd += liquidityPairAmount;
+
+	if (burnAmount > 0 && burnAddress) {
+		burnAddress->addBalance(burnAmount / sfmPrice());
+	}
+
+	cachedReflection += reflectAmount / sfmPrice();
+
+	auto totalSfmToBuy = usdMinusFee / sfmPrice();
+	sfm -= totalSfmToBuy;
+	usd += usdMinusFee;
+
+	if (sfm < 0) {
+		throw std::runtime_error("Failed To Buy SFM! Not enough liquidity!");
+	}
+
+	volume += a_usd;
+
+	return totalSfmToBuy;
+}
 
 class StopLoss : public TradingStrategy {
 public:
@@ -580,6 +610,8 @@ public:
 		wallets(a_initialWallets),
 		personalWallet(a_personalWallet){
 
+		amm.setBurnWallet(wallets[0]);
+
 		double amountLeft = config.MaxSafeMoon - a_amm.safeMoonTotal() - totalWalletAmounts();
 		size_t totalHodlers = 350'000 - wallets.size();
 
@@ -834,8 +866,9 @@ int main() {
 
 	auto personalWallet = std::make_shared<WalletHolder>(config.InitialPersonalHoldings, config.InitialPersonalBuyIn, sharedString("Personal"));
 
+	auto burnWallet = std::make_shared<WalletHolder>(401'252'856'803'308, 0.0);
 	std::vector<std::shared_ptr<WalletHolder>> initialHolders {
-		std::make_shared<WalletHolder>(401'252'856'803'308, 0.0), //Burn address
+		burnWallet, //Burn address
 		makeInitialHolder(46'085'289'300'689),
 		makeInitialHolder(20'959'130'440'245),
 		makeInitialHolder(20'000'000'001'566),
